@@ -1,0 +1,69 @@
+name: build
+
+# Manual only: every run costs a macOS runner, and we iterate deliberately.
+on:
+  workflow_dispatch:
+    inputs:
+      patch:
+        description: "apply the embed-notes patch before building"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    # Two images so one run tells us which Xcode this 2024-era source
+    # actually compiles under, instead of guessing.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Show targets
+        run: xcodebuild -project Skim.xcodeproj -list || true
+
+      - name: Apply patch
+        if: ${{ inputs.patch }}
+        run: python3 tools/apply_patch.py .
+
+      - name: Build
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Skim.xcodeproj \
+            -target Skim \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CONFIGURATION_BUILD_DIR="$PWD/build" \
+            2>&1 | tee build.log | tail -40
+
+      - name: Ad-hoc sign
+        # An unsigned bundle will not launch on Apple Silicon at all, so this
+        # is not optional even for a local build.
+        run: |
+          codesign --force --deep --sign - build/Skim.app
+          codesign -dv build/Skim.app 2>&1 | head -5
+
+      - name: Package
+        run: ditto -c -k --keepParent build/Skim.app "Skim-${{ matrix.os }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: skim-${{ matrix.os }}${{ inputs.patch && '-patched' || '-baseline' }}
+          path: |
+            Skim-${{ matrix.os }}.zip
+            build.log
+          if-no-files-found: warn
