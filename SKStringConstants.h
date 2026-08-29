@@ -56,6 +56,8 @@ extern NSString *SKRememberSnapshotsKey;
 extern NSString *SKWriteLegacySkimNotesKey;
 extern NSString *SKWriteSkimNotesAsArchiveKey;
 extern NSString *SKAutoSaveSkimNotesKey;
+extern NSString *SKEmbedNotesInPDFKey;
+extern NSString *SKNoteGraftToolKey;
 extern NSString *SKSnapshotsOnTopKey;
 extern NSString *SKSnapshotThumbnailSizeKey;
 extern NSString *SKThumbnailSizeKey;

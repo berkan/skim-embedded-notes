@@ -177,6 +177,9 @@ enum {
 }
 
 - (void)updateChangeCount:(NSDocumentChangeType)change {
+    // the automatic convert-on-open is not a user edit; see showWindows
+    if (mdFlags.autoConvertingNotes)
+        return;
     if ((change & NSChangeDiscardable) == 0)
         [super updateChangeCount:change];
 }
@@ -222,6 +225,16 @@ enum {
     
     if (wasVisible == NO)
         [[NSNotificationCenter defaultCenter] postNotificationName:SKDocumentDidShowNotification object:self];
+
+    // Embedded annotations are read-only until converted. Converting them on
+    // open is what makes highlights from other devices editable and lists them
+    // in the notes pane. convertNotes replaces rather than duplicates them.
+    if (wasVisible == NO && SKEmbedsNotesInPDF() && mdFlags.convertingNotes == 0 &&
+        [self hasConvertibleAnnotations])
+    {
+        mdFlags.autoConvertingNotes = 1;
+        [self convertNotes];
+    }
 }
 
 - (void)removeWindowController:(NSWindowController *)windowController {
@@ -292,6 +305,36 @@ enum {
 
 - (NSString *)fileNameExtensionForType:(NSString *)typeName saveOperation:(NSSaveOperationType)saveOperation {
     return [super fileNameExtensionForType:typeName saveOperation:saveOperation] ?: [[SKTemplateManager sharedManager] fileNameExtensionForTemplateType:typeName];
+}
+
+BOOL SKEmbedsNotesInPDF(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:SKEmbedNotesInPDFKey];
+}
+
+// pdfData is meant to be the document *without* Skim notes. Producing that
+// form costs a full re-serialisation, which is exactly what we are avoiding,
+// so the automatic conversion defers it. Build it here, once, only if
+// something genuinely needs it - an export without notes, or a PDF bundle.
+- (NSData *)notesFreePDFData {
+    if (mdFlags.pdfDataNeedsStripping) {
+        mdFlags.pdfDataNeedsStripping = 0;
+        PDFDocument *strippedDoc = [[PDFDocument alloc] initWithData:pdfData];
+        [self tryToUnlockDocument:strippedDoc];
+        for (PDFPage *page in strippedDoc) {
+            for (PDFAnnotation *annotation in [[page annotations] copy]) {
+                if ([annotation isSkimNote] == NO && [annotation isConvertibleAnnotation]) {
+                    PDFAnnotation *popup = [annotation popup];
+                    if (popup)
+                        [page removeAnnotation:popup];
+                    [page removeAnnotation:annotation];
+                }
+            }
+        }
+        NSData *stripped = [strippedDoc dataRepresentation];
+        if (stripped)
+            pdfData = stripped;
+    }
+    return pdfData;
 }
 
 - (BOOL)canAttachNotesForType:(NSString *)typeName {
@@ -585,7 +628,11 @@ enum {
             if ([[NSUserDefaults standardUserDefaults] boolForKey:SKAutoSaveSkimNotesKey] &&
                 (saveOperation != NSAutosaveElsewhereOperation && saveOperation != NSAutosaveAsOperation))
                 didWriteBackupNotes = [self writeBackupNotesToURL:[absoluteURL URLReplacingPathExtension:@"skim"] forSaveOperation:saveOperation];
-            if (NO == [self attachNotesAtURL:absoluteURL]) {
+            if ([self attachNotesAtURL:absoluteURL]) {
+                if (SKEmbedsNotesInPDF() &&
+                    (saveOperation == NSSaveOperation || saveOperation == NSAutosaveInPlaceOperation))
+                    [self runNoteGraftTool];   // graft after each save
+            } else {
                 NSString *message = didWriteBackupNotes ? NSLocalizedString(@"The notes could not be saved with the PDF at \"%@\". However a companion .skim file was successfully updated.", @"Informative text in alert dialog") :
                 NSLocalizedString(@"The notes could not be saved with the PDF at \"%@\"", @"Informative text in alert dialog");
                 NSAlert *alert = [[NSAlert alloc] init];
@@ -622,7 +669,7 @@ enum {
         info = [info mutableCopy];
         [(NSMutableDictionary *)info setObject:options forKey:SKPresentationOptionsKey];
     }
-    [fileWrapper addRegularFileWithContents:pdfData preferredFilename:[name stringByAppendingPathExtension:@"pdf"]];
+    [fileWrapper addRegularFileWithContents:[self notesFreePDFData] preferredFilename:[name stringByAppendingPathExtension:@"pdf"]];
     if ((data = [[[self pdfDocument] string] dataUsingEncoding:NSUTF8StringEncoding]))
         [fileWrapper addRegularFileWithContents:data preferredFilename:[BUNDLE_DATA_FILENAME stringByAppendingPathExtension:@"txt"]];
     if ((data = [NSPropertyListSerialization dataWithPropertyList:info format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL]))
@@ -687,7 +734,16 @@ enum {
         if (mdFlags.exportOption == SKExportOptionWithEmbeddedNotes)
             didWrite = [[self pdfDocument] writeToURL:absoluteURL];
         else
-            didWrite = [pdfData writeToURL:absoluteURL options:0 error:&error];
+            // The ordinary save must write the original bytes untouched. Only
+            // an explicit "without notes" export needs the stripped form, and
+            // producing that costs the full PDFKit re-serialisation - which
+            // doubles a scanned book and destroys its OCR word layer. Routing
+            // the ordinary save through it put that damage straight back on
+            // the save path, which is the one thing this design exists to
+            // avoid.
+            didWrite = [(mdFlags.exportOption == SKExportOptionWithoutNotes
+                         ? [self notesFreePDFData] : pdfData)
+                        writeToURL:absoluteURL options:0 error:&error];
     } else if ([ws type:SKEncapsulatedPostScriptDocumentType conformsToType:typeName] || 
                [ws type:SKDVIDocumentType conformsToType:typeName] || 
                [ws type:SKXDVDocumentType conformsToType:typeName]) {
@@ -1110,7 +1166,8 @@ static BOOL isIgnorablePOSIXError(NSError *error) {
 }
 
 - (void)convertNotesUsingPDFDocument:(PDFDocument *)pdfDocWithoutNotes {
-    [[self mainWindowController] beginProgressSheetWithMessage:[NSLocalizedString(@"Converting notes", @"Message for progress sheet") stringByAppendingEllipsis] maxValue:0];
+    if (mdFlags.autoConvertingNotes == 0)
+        [[self mainWindowController] beginProgressSheetWithMessage:[NSLocalizedString(@"Converting notes", @"Message for progress sheet") stringByAppendingEllipsis] maxValue:0];
     
     NSMapTable *offsets = nil;
     NSMutableArray *annotations = nil;
@@ -1140,37 +1197,54 @@ static BOOL isIgnorablePOSIXError(NSError *error) {
         }
     }
     
+    BOOL autoConverting = mdFlags.autoConvertingNotes != 0;
+    
     if (annotations) {
         
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             
-            // if pdfDocWithoutNotes was nil, the document was not encrypted, so no need to try to unlock
-            PDFDocument *pdfDoc = pdfDocWithoutNotes ?: [[PDFDocument alloc] initWithData:pdfData];
+            NSData *data = nil;
             
-            for (PDFPage *page in pdfDoc) {
-                for (PDFAnnotation *annotation in [[page annotations] copy]) {
-                    if ([annotation isSkimNote] == NO && [annotation isConvertibleAnnotation]) {
-                        PDFAnnotation *popup = [annotation popup];
-                        if (popup)
-                            [page removeAnnotation:popup];
-                        [page removeAnnotation:annotation];
+            if (autoConverting == NO) {
+                // if pdfDocWithoutNotes was nil, the document was not encrypted, so no need to try to unlock
+                PDFDocument *pdfDoc = pdfDocWithoutNotes ?: [[PDFDocument alloc] initWithData:pdfData];
+                
+                for (PDFPage *page in pdfDoc) {
+                    for (PDFAnnotation *annotation in [[page annotations] copy]) {
+                        if ([annotation isSkimNote] == NO && [annotation isConvertibleAnnotation]) {
+                            PDFAnnotation *popup = [annotation popup];
+                            if (popup)
+                                [page removeAnnotation:popup];
+                            [page removeAnnotation:annotation];
+                        }
                     }
                 }
+                
+                data = [pdfDoc dataRepresentation];
             }
-            
-            NSData *data = [pdfDoc dataRepresentation];
             
             dispatch_async(dispatch_get_main_queue(), ^{
                 
                 [[self mainWindowController] addAnnotationsFromDictionaries:noteDicts removeAnnotations:annotations];
                 
-                [self setPDFData:data pageOffsets:offsets];
+                if (data)
+                    [self setPDFData:data pageOffsets:offsets];
+                else
+                    mdFlags.pdfDataNeedsStripping = 1;
                 
                 [[self undoManager] setActionName:NSLocalizedString(@"Convert Notes", @"Undo action name")];
                 
-                [[self mainWindowController] dismissProgressSheet];
+                if (mdFlags.autoConvertingNotes == 0)
+                    [[self mainWindowController] dismissProgressSheet];
                 
                 mdFlags.convertingNotes = 0;
+                
+                if (mdFlags.autoConvertingNotes) {
+                    // nothing here for the user to undo - they did not ask
+                    mdFlags.autoConvertingNotes = 0;
+                    [[self undoManager] removeAllActions];
+                    [super updateChangeCount:NSChangeCleared];
+                }
             });
         });
         
@@ -1388,7 +1462,62 @@ static BOOL isIgnorablePOSIXError(NSError *error) {
 
 #pragma mark Notification handlers
 
+- (void)runNoteGraftTool {
+    NSString *tool = [[NSUserDefaults standardUserDefaults] stringForKey:SKNoteGraftToolKey];
+    NSURL *fileURL = [self fileURL];
+    if ([tool length] == 0 || fileURL == nil || [fileURL isFileURL] == NO)
+        return;
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:tool] == NO)
+        return;
+    // Our own graft changes the file while the document is open, so Skim's
+    // update checker would ask to reload every time. Silence it for the
+    // duration: re-enabling calls reset, which drops the stale modification
+    // date and adopts the file as it now stands rather than reporting it.
+    SKFileUpdateChecker *fuc = fileUpdateChecker;
+    [fuc setEnabled:NO];
+    NSTask *task = [[NSTask alloc] init];
+    NSURL *grafted = fileURL;
+    [task setTerminationHandler:^(NSTask *finished){
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // NSDocument compares the file's modification date with the one it
+            // recorded when saving. The graft changes the file after that, so
+            // the next save reports a conflict - and answering "save anyway"
+            // writes pdfData as loaded at open, throwing away what was
+            // grafted. Adopting the new date is what stops both.
+            // Take the grafted file as our own state. pdfData is what the
+            // next save writes, and it is otherwise still the bytes loaded at
+            // open - so every save put those back, undoing the graft, which
+            // then slowly redid it. An "inert" save reverted the file.
+            NSData *fresh = [NSData dataWithContentsOfURL:grafted];
+            if (fresh)
+                pdfData = fresh;
+            NSDate *modified = [[[NSFileManager defaultManager]
+                                 attributesOfItemAtPath:[grafted path] error:NULL]
+                                fileModificationDate];
+            if (modified)
+                [self setFileModificationDate:modified];
+            [fuc setEnabled:YES];
+        });
+    }];
+    [task setExecutableURL:[NSURL fileURLWithPath:tool]];
+    // --reconcile: the notes Skim just wrote are the complete state, so a
+    // highlight deleted in Skim is deleted from the PDF. Without it the
+    // tool only adds, and deletions would silently come back on reopen.
+    // Save and close do the same thing. Add-only on save existed to dodge a
+    // race - clearing the notes could wipe ones Skim wrote for a later edit -
+    // but --clear-if-unchanged handles that directly, so the asymmetry only
+    // made deletions behave differently from additions for no reason, and left
+    // them dependent on the close hook firing.
+    [task setArguments:@[[fileURL path], @"--reconcile", @"--clear-if-unchanged"]];
+    // fire and forget: closing a document must not wait on it
+    @try {
+        [task launchAndReturnError:NULL];
+    } @catch (NSException *e) {}
+}
+
 - (void)handleWindowWillCloseNotification:(NSNotification *)notification {
+    if (SKEmbedsNotesInPDF())
+        [self runNoteGraftTool];   // graft once the document is closed
     NSWindow *window = [notification object];
     // ignore when we're switching fullscreen/main windows
     if ([window isEqual:[[window windowController] window]]) {
